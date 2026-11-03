@@ -1,0 +1,342 @@
+from m5stack import *
+from m5ui import *
+from uiflow import *
+import wifiCfg
+from umqtt.simple import MQTTClient
+from machine import Pin, I2C
+import neopixel
+import utime
+import ujson
+
+setScreenColor(0x000000)
+
+# ================= UI =================
+label0 = M5TextBox(10, 10, "Connecting WiFi...", lcd.FONT_DejaVu18, 0xFFFFFF, rotate=0)
+modeLabel = M5TextBox(10, 38, "Mode: ?", lcd.FONT_DejaVu18, 0xFFFFFF, rotate=0)
+tempLabel = M5TextBox(10, 66, "Room Temp: --.- C", lcd.FONT_DejaVu18, 0x00FFAA, rotate=0)
+humLabel  = M5TextBox(10, 94, "Cellar Humidity: --.- %", lcd.FONT_DejaVu18, 0x00FFAA, rotate=0)
+msgLabel  = M5TextBox(10, 125, "Waiting...", lcd.FONT_DejaVu18, 0xFFFFFF, rotate=0)
+
+
+# ================= WIFI =================
+wifiCfg.doConnect("HUAWEI P20 lite", "90068681b5d4")
+wait_ms(3000)
+label0.setText("WiFi Connected!")
+
+# ================= MQTT =================
+MQTT_BROKER = "broker.hivemq.com"
+MQTT_PORT   = 1883
+
+MQTT_STATUS_TOPIC = b"home/status"
+MQTT_MOTION_TOPIC = b"home/auto/motion"
+MQTT_ENV_LIVING   = b"home/env/living/state"
+MQTT_ENV_KELLER   = b"home/env/keller/state"
+
+PUBLISH_TO_KELLER = True
+
+# ================= RGB + PIR =================
+RGB_PIN = 26
+np = neopixel.NeoPixel(Pin(RGB_PIN, Pin.OUT), 1)
+
+PIR_PIN = 36
+pir = Pin(PIR_PIN, Pin.IN)
+
+def rgb_set(r, g, b):
+    np[0] = (r, g, b)
+    np.write()
+
+def rgb_off():
+    rgb_set(0, 0, 0)
+
+def rgb_red():
+    rgb_set(255, 0, 0)
+
+def rgb_green():
+    rgb_set(0, 255, 0)
+
+def rgb_blue():
+    rgb_set(0, 0, 255)
+
+rgb_off()
+
+# ================= ENV SENSOR =================
+i2c = I2C(0, scl=Pin(22), sda=Pin(21), freq=100000)
+DHT12_ADDR = 0x5C
+
+def read_dht12():
+    data = i2c.readfrom_mem(DHT12_ADDR, 0x00, 5)
+    hum = data[0] + data[1] / 10.0
+    temp = data[2] + data[3] / 10.0
+    chk = (data[0] + data[1] + data[2] + data[3]) & 0xFF
+    if chk != data[4]:
+        raise Exception("DHT12 checksum error")
+    return float(temp), float(hum)
+
+def safe_read_env():
+    try:
+        return read_dht12()
+    except Exception as e:
+        print("ENV error:", e)
+        return None, None
+
+ENV_PUBLISH_EVERY_MS = 2000
+last_env_pub_ms = 0
+
+def publish_env_if_due(now_ms):
+    global last_env_pub_ms
+
+    if utime.ticks_diff(now_ms, last_env_pub_ms) < ENV_PUBLISH_EVERY_MS:
+        return
+
+    last_env_pub_ms = now_ms
+    t, h = safe_read_env()
+
+    if t is None:
+        tempLabel.setText("Room Temp: --.- C")
+    else:
+        tempLabel.setText("Room Temp: %.1f C" % t)
+
+    if h is None:
+        humLabel.setText("Cellar Humidity: --.- %")
+    else:
+        humLabel.setText("Cellar Humidity: %.1f %%" % h)
+
+    payload = {
+        "room": "living",
+        "ts": int(now_ms)
+    }
+
+    if t is not None:
+        payload["tempC"] = round(t, 2)
+
+    if h is not None:
+        payload["hum"] = round(h, 1)
+
+    try:
+        client.publish(MQTT_ENV_LIVING, ujson.dumps(payload).encode())
+
+        if PUBLISH_TO_KELLER:
+            payload_k = dict(payload)
+            payload_k["room"] = "cellar"
+            client.publish(MQTT_ENV_KELLER, ujson.dumps(payload_k).encode())
+
+        print("ENV published:", payload)
+
+    except Exception as e:
+        print("ENV publish error:", e)
+
+# ================= MOTION SETTINGS =================
+MOTION_TIMEOUT_MS = 10000
+KEEPALIVE_INTERVAL_MS = 2000
+
+last_motion_ms = 0
+auto_on = False
+LAST_KEEPALIVE_MS = 0
+
+# ================= ROOM MODE =================
+MODE_OFF    = 0
+MODE_CELLAR = 1
+MODE_STORE_ROOM  = 2
+
+mode = MODE_OFF
+
+def update_mode_label():
+    if mode == MODE_CELLAR:
+        modeLabel.setText("Mode: CELLAR (A)")
+    elif mode == MODE_STORE_ROOM:
+        modeLabel.setText("Mode: STORE ROOM (B)")
+    else:
+        modeLabel.setText("Mode: OFF (C)")
+
+update_mode_label()
+
+# ================= STATUS HELPERS =================
+def format_status_message(text):
+    t = text.strip()
+    t = t.replace("?", "")
+    t = t.replace("turned ", "")
+    t = t.replace("  ", " ")
+    return t
+
+def is_relevant_device(text_lower):
+    return ("window" in text_lower) or ("door" in text_lower) or ("lock" in text_lower)
+
+def set_rgb_from_message(text):
+    t = text.lower()
+
+    if not is_relevant_device(t):
+        return
+
+    if "unlocked" in t:
+        rgb_green()
+        return
+
+    if "locked" in t:
+        rgb_red()
+        return
+
+    if "open" in t or "off" in t:
+        rgb_green()
+        return
+
+    if "closed" in t or "on" in t:
+        rgb_red()
+        return
+
+# ================= MQTT CALLBACK =================
+def mqtt_callback(topic, msg):
+    try:
+        decoded = msg.decode().strip()
+
+        if decoded.startswith("{"):
+            print("Ignored JSON:", decoded)
+            return
+
+        if decoded.lower() == "alive 1" or decoded.lower().startswith("alive"):
+            print("Ignored alive message:", decoded)
+            return
+
+        pretty = format_status_message(decoded)
+
+        msgLabel.setText(pretty)
+        print("MQTT message:", pretty)
+
+        set_rgb_from_message(pretty)
+
+    except Exception as e:
+        print("MQTT callback error:", e)
+
+# ================= MQTT HELPERS =================
+def publish_motion(payload_str):
+    try:
+        client.publish(MQTT_MOTION_TOPIC, payload_str.encode())
+        print("MOTION published:", payload_str)
+    except Exception as e:
+        print("Publish error:", e)
+
+def turn_off_other_room(new_mode):
+    if new_mode == MODE_CELLAR:
+        publish_motion("STORE_OFF")
+    elif new_mode == MODE_STORE_ROOM:
+        publish_motion("KELLER_OFF")
+    elif new_mode == MODE_OFF:
+        publish_motion("KELLER_OFF")
+        publish_motion("STORE_OFF")
+
+def set_mode(new_mode):
+    global mode, auto_on, last_motion_ms, LAST_KEEPALIVE_MS
+
+    mode = new_mode
+    auto_on = False
+    last_motion_ms = 0
+    LAST_KEEPALIVE_MS = 0
+
+    turn_off_other_room(new_mode)
+    update_mode_label()
+    msgLabel.setText("Mode changed")
+
+    rgb_blue()
+    utime.sleep_ms(200)
+    rgb_off()
+
+def buttonA_wasPressed():
+    set_mode(MODE_CELLAR)
+
+def buttonB_wasPressed():
+    set_mode(MODE_STORE_ROOM)
+
+def buttonC_wasPressed():
+    set_mode(MODE_OFF)
+
+btnA.wasPressed(buttonA_wasPressed)
+btnB.wasPressed(buttonB_wasPressed)
+btnC.wasPressed(buttonC_wasPressed)
+
+# ================= CONNECT MQTT =================
+label0.setText("Connecting MQTT...")
+
+client = MQTTClient("m5stackClientSarah02", MQTT_BROKER, MQTT_PORT)
+client.set_callback(mqtt_callback)
+
+connected = False
+
+for i in range(5):
+    try:
+        client.connect()
+        client.subscribe(MQTT_STATUS_TOPIC)
+        connected = True
+        break
+    except Exception as e:
+        print("MQTT connect error:", e)
+        label0.setText("MQTT retry...")
+        wait_ms(3000)
+
+if connected:
+    label0.setText("MQTT Connected!")
+else:
+    label0.setText("MQTT Failed")
+    while True:
+        wait_ms(1000)
+
+# ================= MAIN LOOP =================
+last_pir_val = -1
+
+while True:
+    try:
+        client.check_msg()
+    except Exception as e:
+        print("MQTT check error:", e)
+
+    now = utime.ticks_ms()
+
+    publish_env_if_due(now)
+
+    v = pir.value()
+
+    
+
+    if mode != MODE_OFF:
+        if v == 1:
+            last_motion_ms = now
+
+            if not auto_on:
+                auto_on = True
+                LAST_KEEPALIVE_MS = now
+
+                if mode == MODE_CELLAR:
+                    publish_motion("KELLER_ON")
+                    msgLabel.setText("Auto: Cellar light ON (motion)")
+
+                elif mode == MODE_STORE_ROOM:
+                    publish_motion("STORE_ON")
+                    msgLabel.setText("Auto: Store Room light ON (motion)")
+
+            if auto_on and utime.ticks_diff(now, LAST_KEEPALIVE_MS) > KEEPALIVE_INTERVAL_MS:
+                LAST_KEEPALIVE_MS = now
+
+                if mode == MODE_CELLAR:
+                    publish_motion("KELLER_ON")
+
+                elif mode == MODE_STORE_ROOM:
+                    publish_motion("STORE_ON")
+
+        if auto_on and utime.ticks_diff(now, last_motion_ms) > MOTION_TIMEOUT_MS:
+            auto_on = False
+
+            if mode == MODE_CELLAR:
+                publish_motion("KELLER_OFF")
+                msgLabel.setText(" Auto: Cellar light OFF(no motion)")
+
+            elif mode == MODE_STORE_ROOM:
+                publish_motion("STORE_OFF")
+                msgLabel.setText("Auto: Store Room light OFF(no motion)")
+
+    wait_ms(100)
+
+
+
+
+
+
+
+
